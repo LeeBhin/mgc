@@ -10,6 +10,7 @@ import { MicOff, HeadphoneOff, Volume2, VolumeX, VideoOff, Mic, Crown, UserX, Ch
  * - 클릭으로 확대/축소 기능
  * - 우클릭으로 개별 볼륨 조절 메뉴 (원격 사용자만)
  * - 방장 전용 강제 제어 메뉴
+ * - 음성 입력 시 글로우 효과
  */
 const VideoCard = ({ 
   participant = {}, 
@@ -77,25 +78,47 @@ const VideoCard = ({
     boxShadow: '0 10px 15px -3px rgba(59, 130, 246, 0.1), 0 4px 6px -2px rgba(59, 130, 246, 0.05)'
   };
 
-  // 말하는 중일 때 그림자 효과
+  // 말하는 중일 때 그림자 효과만 - 부드러운 전환
   const getSpeakingStyle = () => {
-    if (!isSpeaking || !actualIsAudioOn || !actualIsHeadsetOn) return {};
-    return {
-      boxShadow: '0 0 15px rgba(59, 130, 246, 0.5)'
-    };
+    // 현재 사용자인 경우: 실제 오디오 상태 확인
+    if (isCurrentUser) {
+      const currentUserData = participant;
+      const userIsSpeaking = currentUserData?.isSpeaking || false;
+      
+      // 말하는 중이고 오디오와 헤드셋이 켜져있을 때만 그림자 효과
+      if (userIsSpeaking && actualIsAudioOn && actualIsHeadsetOn) {
+        return {
+          boxShadow: isExpanded 
+            ? '0 0 25px rgba(59, 130, 246, 0.7), 0 0 50px rgba(59, 130, 246, 0.3)' 
+            : '0 0 15px rgba(59, 130, 246, 0.8)',
+        };
+      }
+    } else {
+      // 원격 사용자인 경우
+      if (isSpeaking && actualIsAudioOn && actualIsHeadsetOn) {
+        return {
+          boxShadow: isExpanded 
+            ? '0 0 25px rgba(59, 130, 246, 0.7), 0 0 50px rgba(59, 130, 246, 0.3)' 
+            : '0 0 15px rgba(59, 130, 246, 0.8)',
+        };
+      }
+    }
+    
+    // 기본 상태 (말하지 않을 때)
+    return {};
   };
 
   // 표시 상태 계산 - 본인도 강제 제어 상태 반영
   const showVideoElement = (isCurrentUser && localStream) || (!isCurrentUser && remoteStream);
-  const showMicOffIcon = !actualIsAudioOn || isAudioForcedOff; // 본인도 강제 상태 표시
-  const showHeadsetOffIcon = !actualIsHeadsetOn || isHeadsetForcedOff; // 본인도 강제 상태 표시
+  const showMicOffIcon = !actualIsAudioOn || isAudioForcedOff;
+  const showHeadsetOffIcon = !actualIsHeadsetOn || isHeadsetForcedOff;
   const canShowVolumeMenu = !isCurrentUser && actualIsAudioOn && actualIsHeadsetOn && !isAudioForcedOff && !isHeadsetForcedOff;
   const canShowForceMenu = isOwner && !isCurrentUser;
   
   // 강제로 꺼진 상태인지 확인 - 본인도 빨간색 표시
-  const isVideoForcedOffState = isVideoForcedOff; // 본인/타인 구분 없이 모두 표시
-  const isAudioForcedOffState = isAudioForcedOff; // 본인/타인 구분 없이 모두 표시
-  const isHeadsetForcedOffState = isHeadsetForcedOff; // 본인/타인 구분 없이 모두 표시
+  const isVideoForcedOffState = isVideoForcedOff;
+  const isAudioForcedOffState = isAudioForcedOff;
+  const isHeadsetForcedOffState = isHeadsetForcedOff;
 
   // 외부 클릭으로 메뉴 닫기
   useEffect(() => {
@@ -250,7 +273,9 @@ const VideoCard = ({
     <>
       <div 
         ref={cardRef}
-        className="bg-slate-900/90 rounded-lg sm:rounded-xl lg:rounded-2xl relative overflow-hidden shadow-sm border border-slate-700/50 cursor-pointer transition-all duration-200 w-full aspect-video"
+        className={`bg-slate-900/90 rounded-lg sm:rounded-xl lg:rounded-2xl relative overflow-hidden border border-slate-700/50 cursor-pointer w-full aspect-video transition-all duration-500 ease-out ${
+          isExpanded ? 'shadow-2xl' : 'shadow-sm'
+        }`}
         onClick={onClick}
         onContextMenu={handleRightClick}
         style={{ 

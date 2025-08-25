@@ -37,6 +37,12 @@ export const useSocket = (onRoomInfoUpdate = null) => {
   const isAudioOnRef = useRef(false);
   const isHeadsetOnRef = useRef(true);
 
+  // 오디오 레벨 분석을 위한 변수들
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const sourceRef = useRef(null);
+  const animationFrameRef = useRef(null);
+
   // ICE 서버 설정
   const iceServers = {
     iceServers: [
@@ -128,6 +134,7 @@ export const useSocket = (onRoomInfoUpdate = null) => {
           localVideoRef.current.srcObject = localStreamRef.current;
         }
 
+        // PeerConnection 트랙 교체
         if (Object.keys(peerConnectionsRef.current).length > 0) {
           Object.entries(peerConnectionsRef.current).forEach(([socketId, pc]) => {
             try {
@@ -184,6 +191,7 @@ export const useSocket = (onRoomInfoUpdate = null) => {
         }
         localStreamRef.current.addTrack(newAudioTrack);
 
+        // PeerConnection 트랙 교체
         if (Object.keys(peerConnectionsRef.current).length > 0) {
           Object.entries(peerConnectionsRef.current).forEach(([socketId, pc]) => {
             try {
@@ -199,6 +207,12 @@ export const useSocket = (onRoomInfoUpdate = null) => {
               console.warn(`PeerConnection 처리 실패 (${socketId}):`, err);
             }
           });
+        }
+
+        // 오디오 분석 재시작
+        stopAudioLevelAnalysis();
+        if (participants.length > 0) {
+          setTimeout(() => startAudioLevelAnalysis(), 100);
         }
 
         console.log('오디오 입력 장치 변경 완료');
@@ -449,6 +463,84 @@ export const useSocket = (onRoomInfoUpdate = null) => {
     }
   }, [createPeerConnection]);
 
+  // 오디오 레벨 분석 시작
+  const startAudioLevelAnalysis = useCallback(() => {
+    if (!localStreamRef.current || audioContextRef.current) return;
+
+    try {
+      const audioTrack = localStreamRef.current.getAudioTracks()[0];
+      if (!audioTrack) return;
+
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      analyserRef.current = audioContextRef.current.createAnalyser();
+      sourceRef.current = audioContextRef.current.createMediaStreamSource(localStreamRef.current);
+
+      analyserRef.current.fftSize = 2048;
+      analyserRef.current.smoothingTimeConstant = 0.8;
+      sourceRef.current.connect(analyserRef.current);
+
+      const analyzeAudio = () => {
+        if (!analyserRef.current || !socketRef.current) return;
+
+        const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+        analyserRef.current.getByteTimeDomainData(dataArray);
+
+        let peak = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          const value = Math.abs(dataArray[i] - 128);
+          if (value > peak) {
+            peak = value;
+          }
+        }
+
+        const threshold = 5; // 더 낮은 임계값으로 설정
+        const normalizedPeak = peak > threshold ? peak / 30 : 0;
+        const level = normalizedPeak > 0 ? Math.min(100, Math.pow(normalizedPeak, 0.65) * 100) : 0;
+        const isSpeaking = level > 15; // 말하는 중 판단 임계값
+
+        // 오디오가 켜져있고 헤드셋이 켜져있을 때만 전송
+        if (isAudioOnRef.current && isHeadsetOnRef.current) {
+          socketRef.current.emit('audio-level', {
+            level: level,
+            isSpeaking: isSpeaking
+          });
+        } else {
+          // 오디오가 꺼져있으면 0으로 전송
+          socketRef.current.emit('audio-level', {
+            level: 0,
+            isSpeaking: false
+          });
+        }
+
+        animationFrameRef.current = requestAnimationFrame(analyzeAudio);
+      };
+
+      analyzeAudio();
+    } catch (error) {
+      console.error('오디오 레벨 분석 시작 실패:', error);
+    }
+  }, []);
+
+  // 오디오 레벨 분석 중지
+  const stopAudioLevelAnalysis = useCallback(() => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+
+    if (sourceRef.current) {
+      sourceRef.current.disconnect();
+      sourceRef.current = null;
+    }
+
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+
+    analyserRef.current = null;
+  }, []);
+
   // 사용자 상태 업데이트 함수
   const updateUserStatus = useCallback((statusData) => {
     if (socketRef.current) {
@@ -533,6 +625,9 @@ export const useSocket = (onRoomInfoUpdate = null) => {
               }
             }
           }, 100);
+
+          // 오디오 분석 시작
+          setTimeout(() => startAudioLevelAnalysis(), 500);
 
           const existingParticipants = participants.filter(p => p.socketId !== newSocket.id);
           existingParticipants.forEach((participant, index) => {
@@ -650,6 +745,17 @@ export const useSocket = (onRoomInfoUpdate = null) => {
         setParticipants(participants);
       });
 
+      // 오디오 레벨 업데이트 수신
+      newSocket.on('audio-level-update', ({ socketId, username, level, isSpeaking }) => {
+        setParticipants(prev => 
+          prev.map(p => 
+            p.socketId === socketId 
+              ? { ...p, audioLevel: level, isSpeaking: isSpeaking }
+              : p
+          )
+        );
+      });
+
       newSocket.on('new-message', (message) => {
         setMessages(prev => [...prev, message]);
       });
@@ -665,7 +771,7 @@ export const useSocket = (onRoomInfoUpdate = null) => {
         window.dispatchEvent(new CustomEvent('room-force-closed'));
       });
 
-      // 강제 제어 명령 수신 - 수정된 로직
+      // 강제 제어 명령 수신
       newSocket.on('force-control-command', async ({ action, value, controllerName, finalStates }) => {
         console.log(`[클라이언트] 강제 제어 수신: ${action}=${value} by ${controllerName}`);
         console.log('[클라이언트] 최종 상태:', finalStates);
@@ -711,6 +817,12 @@ export const useSocket = (onRoomInfoUpdate = null) => {
                     }
                   }
                 });
+
+                // 오디오 분석 재시작
+                if (finalStates.isAudioOn) {
+                  stopAudioLevelAnalysis();
+                  setTimeout(() => startAudioLevelAnalysis(), 100);
+                }
               } else {
                 await applyVoiceOptimizedSettings(audioTrack);
                 audioTrack.enabled = false;
@@ -721,6 +833,9 @@ export const useSocket = (onRoomInfoUpdate = null) => {
                     video.muted = true;
                   }
                 });
+
+                // 오디오 분석 중지
+                stopAudioLevelAnalysis();
               }
             }
           }
@@ -735,87 +850,6 @@ export const useSocket = (onRoomInfoUpdate = null) => {
           }, 100);
 
           console.log(`[클라이언트] 강제 제어 적용 완료: video=${finalStates.isVideoOn}, audio=${finalStates.isAudioOn}, headset=${finalStates.isHeadsetOn}`);
-        } else {
-          // 구버전 호환용 - finalStates가 없는 경우
-          console.warn('[클라이언트] finalStates가 없음, 구버전 방식으로 처리');
-
-          switch (action) {
-            case 'video':
-              setIsVideoForcedOff(!value);
-              if (localStreamRef.current) {
-                const videoTrack = localStreamRef.current.getVideoTracks()[0];
-                if (videoTrack) {
-                  videoTrack.enabled = value;
-                  setIsVideoOn(value);
-                  isVideoOnRef.current = value;
-
-                  if (socketRef.current) {
-                    socketRef.current.emit('toggle-video', { isVideoOn: value });
-                  }
-                }
-              }
-              break;
-
-            case 'audio':
-              setIsAudioForcedOff(!value);
-              if (localStreamRef.current) {
-                const audioTrack = localStreamRef.current.getAudioTracks()[0];
-                if (audioTrack) {
-                  audioTrack.enabled = value && isHeadsetOnRef.current;
-                  setIsAudioOn(value);
-                  isAudioOnRef.current = value;
-
-                  if (socketRef.current) {
-                    socketRef.current.emit('toggle-audio', { isAudioOn: value });
-                  }
-                }
-              }
-              break;
-
-            case 'headset':
-              setIsHeadsetForcedOff(!value);
-
-              if (localStreamRef.current) {
-                const audioTrack = localStreamRef.current.getAudioTracks()[0];
-                if (audioTrack) {
-                  if (value) {
-                    await applyHighQualityAudioSettings(audioTrack);
-                    setIsHeadsetOn(true);
-                    isHeadsetOnRef.current = true;
-
-                    document.querySelectorAll('video').forEach(video => {
-                      if (video !== localVideoRef.current) {
-                        video.muted = false;
-                        if (video.setSinkId && selectedAudioOutput) {
-                          video.setSinkId(selectedAudioOutput).catch(console.warn);
-                        }
-                      }
-                    });
-                  } else {
-                    await applyVoiceOptimizedSettings(audioTrack);
-                    audioTrack.enabled = false;
-
-                    setIsHeadsetOn(false);
-                    isHeadsetOnRef.current = false;
-                    setIsAudioOn(false);
-                    isAudioOnRef.current = false;
-                    setIsAudioForcedOff(true);
-
-                    if (socketRef.current) {
-                      socketRef.current.emit('toggle-audio', { isAudioOn: false });
-                      socketRef.current.emit('toggle-headset', { isHeadsetOn: false });
-                    }
-
-                    document.querySelectorAll('video').forEach(video => {
-                      if (video !== localVideoRef.current) {
-                        video.muted = true;
-                      }
-                    });
-                  }
-                }
-              }
-              break;
-          }
         }
       });
 
@@ -859,7 +893,7 @@ export const useSocket = (onRoomInfoUpdate = null) => {
         socket.disconnect();
       }
     };
-  }, [socket, createPeerConnection, startCall]);
+  }, [socket, createPeerConnection, startCall, startAudioLevelAnalysis, stopAudioLevelAnalysis]);
 
   // 로컬 비디오 설정
   useEffect(() => {
@@ -869,6 +903,20 @@ export const useSocket = (onRoomInfoUpdate = null) => {
       localVideoRef.current.play().catch(() => { });
     }
   }, [localStream]);
+
+  // 로컬 스트림이 변경될 때 오디오 분석 시작
+  useEffect(() => {
+    if (localStreamRef.current && participants.length > 0) {
+      const audioTrack = localStreamRef.current.getAudioTracks()[0];
+      if (audioTrack) {
+        startAudioLevelAnalysis();
+      }
+    }
+
+    return () => {
+      stopAudioLevelAnalysis();
+    };
+  }, [localStream, participants.length, startAudioLevelAnalysis, stopAudioLevelAnalysis]);
 
   // 상태와 ref 동기화
   useEffect(() => {
@@ -936,12 +984,19 @@ export const useSocket = (onRoomInfoUpdate = null) => {
           socketRef.current.emit('toggle-audio', { isAudioOn: newAudioState });
         }
 
+        // 오디오 분석 상태 업데이트
+        if (newAudioState) {
+          startAudioLevelAnalysis();
+        } else {
+          stopAudioLevelAnalysis();
+        }
+
         playAllVideos();
       }
     }
   };
 
-  // 헤드셋 토글 - 수정된 로직
+  // 헤드셋 토글
   const handleToggleHeadset = async () => {
     if (isHeadsetForcedOff) {
       return;
@@ -963,6 +1018,11 @@ export const useSocket = (onRoomInfoUpdate = null) => {
 
           if (socketRef.current) {
             socketRef.current.emit('toggle-audio', { isAudioOn: previousAudioState });
+          }
+
+          // 오디오 분석 재시작
+          if (previousAudioState) {
+            startAudioLevelAnalysis();
           }
         }
 
@@ -986,6 +1046,9 @@ export const useSocket = (onRoomInfoUpdate = null) => {
           if (socketRef.current) {
             socketRef.current.emit('toggle-audio', { isAudioOn: false });
           }
+
+          // 오디오 분석 중지
+          stopAudioLevelAnalysis();
         }
 
         document.querySelectorAll('video').forEach(video => {
@@ -1129,6 +1192,9 @@ export const useSocket = (onRoomInfoUpdate = null) => {
 
   // 방 나가기
   const leaveRoom = () => {
+    // 오디오 분석 중지
+    stopAudioLevelAnalysis();
+
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track => track.stop());
     }
